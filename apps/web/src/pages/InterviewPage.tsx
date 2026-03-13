@@ -3,6 +3,26 @@ import { useQuery } from '@tanstack/react-query';
 import Layout from '../components/Layout';
 import client from '../api/client';
 
+// ── Puter.js global type ───────────────────────────────────────────────────
+declare global {
+  interface Window {
+    puter?: {
+      ai: {
+        chat: (
+          messages: { role: string; content: string }[] | string,
+          options?: { model?: string; stream?: boolean },
+        ) => Promise<any>;
+      };
+      auth: {
+        isSignedIn: () => boolean;
+        signIn: () => Promise<void>;
+        signOut: () => Promise<void>;
+        getUser: () => Promise<{ username: string }>;
+      };
+    };
+  }
+}
+
 // ── Types ─────────────────────────────────────────────────────────────────
 
 interface Source {
@@ -39,7 +59,9 @@ function SourceCard({ source }: { source: Source }) {
             </span>
           ))}
         </div>
-        <span className="text-gray-600 text-[10px]">{source.score}% match</span>
+        {source.score > 0 && (
+          <span className="text-gray-600 text-[10px]">{source.score}% match</span>
+        )}
       </div>
       <p className="text-gray-300 leading-relaxed">
         {expanded ? text : text.slice(0, 160)}
@@ -60,11 +82,9 @@ function SourceCard({ source }: { source: Source }) {
 function AssistantMessage({ msg }: { msg: Message }) {
   return (
     <div className="flex gap-3 max-w-full">
-      {/* Avatar */}
       <div className="w-8 h-8 rounded-full bg-sky-500/20 flex items-center justify-center shrink-0 mt-0.5">
         <span className="text-sm">🧠</span>
       </div>
-
       <div className="flex-1 min-w-0">
         {msg.loading ? (
           <div className="flex items-center gap-1.5 py-2">
@@ -82,9 +102,7 @@ function AssistantMessage({ msg }: { msg: Message }) {
               <div className="mt-3">
                 <p className="text-[11px] text-gray-500 mb-2 px-1">
                   📚 {msg.sources.length} note{msg.sources.length !== 1 ? 's' : ''} used as context
-                  {msg.model && (
-                    <span className="ml-2 text-gray-600">· {msg.model}</span>
-                  )}
+                  {msg.model && <span className="ml-2 text-gray-600">· via {msg.model}</span>}
                 </p>
                 <div className="space-y-2">
                   {msg.sources.slice(0, 3).map((s) => (
@@ -119,6 +137,31 @@ function UserMessage({ msg }: { msg: Message }) {
   );
 }
 
+// ── Puter sign-in banner ───────────────────────────────────────────────────
+
+function PuterSignInBanner({ onSignIn }: { onSignIn: () => void }) {
+  return (
+    <div className="bg-gradient-to-r from-violet-500/10 to-sky-500/10 border border-violet-500/20 rounded-xl px-5 py-4 flex items-center justify-between gap-4">
+      <div>
+        <p className="text-sm font-semibold text-white">Sign in with Puter for free AI</p>
+        <p className="text-xs text-gray-400 mt-0.5">
+          No API key needed — powered by{' '}
+          <a href="https://puter.com" target="_blank" rel="noopener noreferrer" className="text-violet-400 hover:underline">
+            Puter.com
+          </a>{' '}
+          (free for users)
+        </p>
+      </div>
+      <button
+        onClick={onSignIn}
+        className="px-4 py-2 bg-violet-600 hover:bg-violet-700 text-white text-sm font-medium rounded-lg transition-colors shrink-0"
+      >
+        Sign in with Puter
+      </button>
+    </div>
+  );
+}
+
 // ── Suggested questions ───────────────────────────────────────────────────
 
 const SUGGESTIONS = [
@@ -132,11 +175,16 @@ const SUGGESTIONS = [
 
 // ── Main Page ─────────────────────────────────────────────────────────────
 
+// dev mode-ல testMode=true → sign-in வேண்டாம், mock response வருது
+const IS_DEV = import.meta.env.DEV;
+
 export default function InterviewPage() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [workspaceId, setWorkspaceId] = useState('');
   const [loading, setLoading] = useState(false);
+  const [puterReady, setPuterReady] = useState(false);
+  const [puterUser, setPuterUser] = useState<string | null>(IS_DEV ? 'dev-mode' : null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -145,56 +193,85 @@ export default function InterviewPage() {
     queryFn: () => client.get('/workspaces').then((r) => r.data),
   });
 
+  // ── Check Puter availability ─────────────────────────────────────────────
+  useEffect(() => {
+    const check = () => {
+      if (window.puter) {
+        setPuterReady(true);
+        if (window.puter.auth.isSignedIn()) {
+          window.puter.auth.getUser().then((u) => setPuterUser(u.username)).catch(() => {});
+        }
+      }
+    };
+    check();
+    // Puter.js loads async — retry a few times
+    const t1 = setTimeout(check, 500);
+    const t2 = setTimeout(check, 1500);
+    return () => { clearTimeout(t1); clearTimeout(t2); };
+  }, []);
+
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
+  // ── Sign in with Puter ────────────────────────────────────────────────────
+  async function signInWithPuter() {
+    if (!window.puter) return;
+    try {
+      await window.puter.auth.signIn();
+      const user = await window.puter.auth.getUser();
+      setPuterUser(user.username);
+    } catch (err: any) {
+      console.error('Puter sign-in failed:', err);
+    }
+  }
+
+  // ── Send message using Puter.ai ──────────────────────────────────────────
   async function sendMessage(question: string) {
     if (!question.trim() || loading) return;
 
-    const userMsg: Message = {
-      id: Date.now().toString(),
-      role: 'user',
-      content: question.trim(),
-    };
-    const loadingMsg: Message = {
-      id: (Date.now() + 1).toString(),
-      role: 'assistant',
-      content: '',
-      loading: true,
-    };
+    const userMsg: Message = { id: Date.now().toString(), role: 'user', content: question.trim() };
+    const loadingMsg: Message = { id: (Date.now() + 1).toString(), role: 'assistant', content: '', loading: true };
 
     setMessages((prev) => [...prev, userMsg, loadingMsg]);
     setInput('');
     setLoading(true);
 
     try {
-      const { data } = await client.post('/interview/ask', {
+      // ── Step 1: Get RAG context from our backend ─────────────────────────
+      const { data: ctx } = await client.post('/interview/context', {
         question: question.trim(),
         workspaceId: workspaceId || undefined,
       });
 
+      // ── Step 2: Generate answer with Puter.js (free AI) ──────────────────
+      let answer = '';
+      let model = 'puter-ai';
+
+      // ── Backend: Groq (free) → Claude → Ollama chain ─────────────────────
+      const { data: askData } = await client.post('/interview/ask', {
+        question: question.trim(),
+        workspaceId: workspaceId || undefined,
+      });
+      answer = askData.answer;
+      model = askData.model;
+
       setMessages((prev) =>
         prev.map((m) =>
           m.id === loadingMsg.id
-            ? {
-                ...m,
-                loading: false,
-                content: data.answer,
-                sources: data.sources,
-                model: data.model,
-              }
+            ? { ...m, loading: false, content: answer, sources: ctx.sources, model }
             : m,
         ),
       );
-    } catch {
+    } catch (err: any) {
+      const errMsg = err?.response?.data?.message ?? err?.message ?? 'Unknown error';
       setMessages((prev) =>
         prev.map((m) =>
           m.id === loadingMsg.id
             ? {
                 ...m,
                 loading: false,
-                content: '⚠️ Failed to get an answer. Make sure Ollama is running (`ollama serve`) or set CLAUDE_API_KEY.',
+                content: `⚠️ ${errMsg}\n\nTip: Sign in with Puter for free AI, or set CLAUDE_API_KEY in the API.`,
               }
             : m,
         ),
@@ -212,9 +289,8 @@ export default function InterviewPage() {
     }
   }
 
-  function clearChat() {
-    setMessages([]);
-  }
+  // dev mode-ல banner வேண்டாம் (testMode use பண்றோம்)
+  const showPuterBanner = puterReady && !puterUser && !IS_DEV;
 
   return (
     <Layout>
@@ -231,6 +307,11 @@ export default function InterviewPage() {
           </div>
 
           <div className="flex items-center gap-3">
+            {/* Free AI badge */}
+            <span className="text-xs text-emerald-400 border border-emerald-500/30 px-2 py-1 rounded-lg">
+              🆓 Free AI · No API Key
+            </span>
+
             {/* Workspace scope */}
             <select
               className="px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-sky-500 text-white"
@@ -245,7 +326,7 @@ export default function InterviewPage() {
 
             {messages.length > 0 && (
               <button
-                onClick={clearChat}
+                onClick={() => setMessages([])}
                 className="px-3 py-2 text-xs text-gray-500 hover:text-red-400 transition-colors border border-gray-700 rounded-lg"
               >
                 Clear chat
@@ -257,9 +338,14 @@ export default function InterviewPage() {
         {/* Chat area */}
         <div className="flex-1 overflow-y-auto px-8 py-6 space-y-6">
           {messages.length === 0 ? (
-            /* Empty state + suggestions */
-            <div className="max-w-2xl mx-auto">
-              <div className="text-center mb-10 pt-8">
+            <div className="max-w-2xl mx-auto space-y-5">
+              {/* Puter sign-in banner */}
+              {showPuterBanner && (
+                <PuterSignInBanner onSignIn={signInWithPuter} />
+              )}
+
+              {/* Empty state */}
+              <div className="text-center mb-6 pt-4">
                 <div className="w-16 h-16 rounded-2xl bg-sky-500/10 border border-sky-500/20 flex items-center justify-center text-3xl mx-auto mb-4">
                   🧠
                 </div>
@@ -267,6 +353,9 @@ export default function InterviewPage() {
                 <p className="text-gray-400 text-sm leading-relaxed">
                   Ask anything — I'll answer using your captured notes as context,<br />
                   then fill in gaps with general knowledge.
+                </p>
+                <p className="text-xs text-emerald-400 mt-2">
+                  🆓 Powered by Groq AI — Free forever, no user sign-in needed
                 </p>
               </div>
 
@@ -294,7 +383,6 @@ export default function InterviewPage() {
               )}
             </div>
           )}
-
           <div ref={bottomRef} />
         </div>
 
@@ -308,7 +396,6 @@ export default function InterviewPage() {
                 value={input}
                 onChange={(e) => {
                   setInput(e.target.value);
-                  // auto-resize
                   e.target.style.height = 'auto';
                   e.target.style.height = Math.min(e.target.scrollHeight, 120) + 'px';
                 }}
@@ -329,7 +416,7 @@ export default function InterviewPage() {
               </button>
             </div>
             <p className="text-[11px] text-gray-700 mt-2 text-center">
-              Powered by your notes + {workspaceId ? 'workspace' : 'all'} knowledge base
+              🆓 Groq AI (free) + your {workspaceId ? 'workspace' : 'all'} notes · No user sign-in needed
             </p>
           </div>
         </div>
